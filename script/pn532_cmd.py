@@ -125,18 +125,16 @@ class Pn532CMD:
                 if len(resp) > 16:
                     resp = resp[:16]
                 block_data[f"{block}"] = resp.hex()
-                # print block index with padding 2 spaces
-                # print(f"block {block:02d}: {resp.hex().upper()}")
                 if block == 0:
                     print(
-                        f"block {block:02d}: {CY}{resp.hex()[0:8].upper()}{CR}{resp.hex()[8:10].upper()}{CG}{resp.hex()[10:14].upper()}{C0}{resp.hex()[14:].upper()}{C0}"
+                        f"{block:02d}: {CY}{resp.hex()[0:8].upper()}{CR}{resp.hex()[8:10].upper()}{CG}{resp.hex()[10:12].upper()}{CY}{resp.hex()[12:16].upper()}{C0}{resp.hex()[16:].upper()}{C0}"
                     )
                 elif block % 4 == 3:
                     print(
-                        f"block {block:02d}: {CG}{resp.hex()[0:12].upper()}{CR}{resp.hex()[12:20].upper()}{CG}{resp.hex()[20:].upper()}{C0}"
+                        f"{block:02d}: {CG}{resp.hex()[0:12].upper()}{CR}{resp.hex()[12:20].upper()}{CG}{resp.hex()[20:].upper()}{C0}"
                     )
                 else:
-                    print(f"block {block:02d}: {resp.hex().upper()}")
+                    print(f"{block:02d}: {resp.hex().upper()}")
                 block += 1
             tag_info["blocks"] = block_data
         except Exception as e:
@@ -394,7 +392,7 @@ class Pn532CMD:
         if len(resp) >= 30:
             return True
         return False
- 
+
     def mf1_auth_one_key_block(self, block, type_value: MfcKeyType, key, uid) -> bool:
         if len(uid) > 4:
             uid = uid[-4:]
@@ -402,6 +400,38 @@ class Pn532CMD:
         data = struct.pack(format_str, 0x01, type_value, block, key, uid)
         resp = self.device.send_cmd_sync(Command.InDataExchange, data)
         return resp.data[0] == Status.HF_TAG_OK
+    
+    mf1_authenticated_sector = -1
+    mf1_authenticated_useKeyA = True
+    
+    def mf1_read_block(self, block, key):
+        current_sector = block // 4 if block < 128 else ((block - 128) // 16 + 32)
+        if self.mf1_authenticated_sector != current_sector:
+            resp = self.hf14a_scan()
+            if resp == None:
+                print("No tag found")
+                return resp
+            uidID1 = bytes(resp[0]["uid"])
+            auth_result = self.mf1_auth_one_key_block(block, MfcKeyType.A, key, uidID1)
+            if not auth_result:
+                self.mf1_authenticated_useKeyA = False
+                resp = self.hf14a_scan()
+                auth_result = self.mf1_auth_one_key_block(block, MfcKeyType.B, key, uidID1)
+            if not auth_result:
+                self.mf1_authenticated_useKeyA = True
+                return Response(Command.InDataExchange, Status.MF_ERR_AUTH)
+            self.mf1_authenticated_sector = current_sector
+        
+        data = struct.pack("!BBB", 0x01, MifareCommand.MfReadBlock, block)
+        resp = self.device.send_cmd_sync(Command.InDataExchange, data)
+        resp.parsed = resp.data
+        if len(resp.data) >= 16:
+            if self.is_mf_trailler_block(block):
+                if self.mf1_authenticated_useKeyA:
+                    resp.parsed = key + resp.parsed[6:]
+                else:
+                    resp.parsed = resp.parsed[0:10] + key
+        return resp
 
     def mf1_read_one_block(self, block, type_value: MfcKeyType, key):
         resp = self.hf14a_scan()
@@ -425,8 +455,27 @@ class Pn532CMD:
                     resp.parsed = resp.parsed[0:10] + key
         return resp
 
-    def is_mf_trailler_block(self, block) -> bool:
-        return block % 4 == 3
+    def is_mf_trailler_block(self, block_index) -> bool:
+        if block_index < 128:
+            return (block_index + 1) % 4 == 0
+        else:
+            return (block_index + 1 - 128) % 16 == 0
+
+    @expect_response(Status.HF_TAG_OK)
+    def mf1_write_block(self, uid, block, key, block_data):
+        auth_result = self.mf1_auth_one_key_block(
+            block, MfcKeyType.A, key, uid
+        )
+        if not auth_result:
+            auth_result = self.mf1_auth_one_key_block(block, MfcKeyType.B, key, uid)
+        if not auth_result:
+            return Response(Command.InDataExchange, Status.HF_TAG_NO)
+        data = struct.pack(
+            "!BBB16s", 0x01, MifareCommand.MfWriteBlock, block, block_data
+        )
+        resp = self.device.send_cmd_sync(Command.InDataExchange, data)
+        resp.parsed = resp.data[0] == Status.HF_TAG_OK
+        return resp
 
     @expect_response(Status.HF_TAG_OK)
     def mf1_write_one_block(self, uid, block, type_value: MfcKeyType, key, block_data):
@@ -536,7 +585,7 @@ class Pn532CMD:
                 data.append({"tagType": tagType, "tagNum": tagNum, "id": uidHex, "dec": uidDec})
             resp.parsed = data
         return resp
-    
+
     def lf_em4100_eset_id(self, slot, uid: bytes):
         """
         Set id for EM4100 emulator
@@ -544,7 +593,7 @@ class Pn532CMD:
         resp_set = self.upload_data_block(type = 0x04, slot = slot + 0x12, data = uid)
         resp_save = self.upload_data_block_done(type = 0x04, slot = slot + 18)
         return resp_set and resp_save
-    
+
     @expect_response(Status.SUCCESS)
     def hf_15_scan(self):
         self.device.set_normal_mode()
@@ -583,11 +632,11 @@ class Pn532CMD:
                 data.append({"tagType": tagType, "tagNum": tagNum, "uid": uidHex})
             resp.parsed = data
         return resp
-    
+
     def hf_15_info(self):
         command = b"\x02\x2B"
         resp = self.hf_15_raw(options = {"select_tag": 0, "append_crc": 1, "no_check_response": 0}, data = command)
-        #example: 00(status) 0F(flags) 77 66 55 44 33 22 11 E0(uid7 to uid0) 00(Dsfid) 00(Afi) 07(block size) 03 8B(IcReference) F9 4D
+        # example: 00(status) 0F(flags) 77 66 55 44 33 22 11 E0(uid7 to uid0) 00(Dsfid) 00(Afi) 07(block size) 03 8B(IcReference) F9 4D
         if len(resp.data) > 15:
             return {
                 "flags": resp.data[1],
@@ -598,7 +647,6 @@ class Pn532CMD:
                 "ic_reference": resp.data[14],
             }
         return None
-        
 
     def hf_15_read_block(self, block):
         command = b"\x01\x20" + bytes([block])
@@ -606,7 +654,7 @@ class Pn532CMD:
         if len(resp.data) == 5 and resp.data[0] == 0x00:
             return resp.data[1:]
         return None
-        
+
     def hf_15_write_block(self, block, data):
         command = b"\x01\x21" + bytes([block]) + data
         resp = self.device.send_cmd_sync(Command.InDataExchange, command)
@@ -650,7 +698,7 @@ class Pn532CMD:
                 f"Send: {bytes(data).hex().upper()} Status: {hex(resp.status)}, Data: {resp.parsed.hex().upper()}"
             )
         return resp
-    
+
     def hf_15_set_gen1_uid(self, uid: bytes, block_size: int):
         return self.hf_15_write_block(block_size, uid[4:][::-1]) and self.hf_15_write_block(block_size + 1, uid[:4][::-1])
 
@@ -664,7 +712,7 @@ class Pn532CMD:
         resp2 = self.hf_15_raw(options = {"select_tag": 0, "append_crc": 1, "no_check_response": 1}, data = command2)
         # print(f"Set uid2 {uid.hex()}: {resp2.data.hex().upper()}")
         return True
-        
+
     def hf_15_set_gen2_config(self, size: int, afi: int, dsfid: int, ic_reference: int):
         # 02e00946 00 00 00 00: last 2 byte is afi and dsfid
         command = b"\x02\xE0\x09\x46\x00\x00" + bytes([afi]) + bytes([dsfid])
